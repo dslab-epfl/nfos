@@ -1,0 +1,13 @@
+diff --git a/config/common_base b/config/common_base
+index e74febef4..40b94d57e 100644
+--- a/config/common_base
++++ b/config/common_base
+@@ -236,7 +236,7 @@ CONFIG_RTE_LIBRTE_MLX4_TX_MP_CACHE=8
+ #
+ # Compile burst-oriented Mellanox ConnectX-4 & ConnectX-5 (MLX5) PMD
+ #
+-CONFIG_RTE_LIBRTE_MLX5_PMD=n
++CONFIG_RTE_LIBRTE_MLX5_PMD=y
+ CONFIG_RTE_LIBRTE_MLX5_DEBUG=n
+ CONFIG_RTE_LIBRTE_MLX5_TX_MP_CACHE=8
+ 

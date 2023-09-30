@@ -1,0 +1,260 @@
+diff --git a/src/nf.c b/src/nf.c
+index 1d9a463..553a081 100644
+--- a/src/nf.c
++++ b/src/nf.c
+@@ -154,6 +154,24 @@ static bool do_expiration = false;
+ // NIC stats holder
+ static struct rte_eth_stats *dev_stats;
+ 
++// For latency debugging
++/*
++typedef struct debug_latency_record {
++  int batch_latency;
++  // uint64_t batch_start_ts;
++  uint8_t batch_size;
++  int expiration_batch_latency;
++  // uint64_t expiration_batch_start_ts;
++  int expiration_batch_size;
++  // int rx_queue_len;
++} debug_latency_record_t;
++
++static debug_latency_record_t *debug_latency_records;
++static int batch_id = 0;
++#define MAX_NUM_DEBUG_LATENCY_RECORDS 10000000
++*/
++
++
+ static void update_dev_stats(struct rte_eth_stats *dev_stats, int nb_devices) {
+   for (int port = 0; port < nb_devices; port++)
+     rte_eth_stats_get(port, &dev_stats[port]);
+@@ -261,6 +279,10 @@ static int nf_init_device(uint16_t device, struct rte_mempool **mbuf_pools, uint
+ 
+ // --- Per-core work ---
+ 
++// hack to align drop_monitor timestamps with trace-cmd timestamps
++static pid_t monitor_pid;
++static uint64_t monitor_start;
++
+ // entry function to various NF threads, a bit ugly...
+ static int lcore_entry(void* arg) {
+   int lcore_ind = rte_lcore_index(-1);
+@@ -276,6 +298,10 @@ static int lcore_entry(void* arg) {
+ }
+ 
+ static int process_main(void* unused) {
++  // hack to align drop_monitor timestamps with trace-cmd timestamps
++  monitor_pid = getppid();
++  monitor_start = rte_get_tsc_cycles();
++
+   //
+   int num_queues = rte_lcore_count() - 1;
+ 
+@@ -312,8 +338,15 @@ static int process_main(void* unused) {
+   int partition_to_expire = 0;
+ #endif
+ 
++  // LATENCY DEBUG
++  int sampling_cnt = 0;
++
+   VIGOR_LOOP_BEGIN
+ 
++    // Latency debug
++    uint64_t ts_start, ts_end, ts_end2;
++    int num_expired;
++
+ #ifndef DEBUG_REAL_NOP
+     RTE_PER_LCORE(curr_time) = VIGOR_NOW;
+ #endif
+@@ -341,7 +374,11 @@ static int process_main(void* unused) {
+       // NF_DEBUG("RCU dereference");
+       non_pkt_set_state = rcu_dereference(non_pkt_set_state_curr_version);
+                   // non_pkt_set_state_versions[non_pkt_set_state_curr_version];
+-      delete_expired_pkt_sets(RTE_PER_LCORE(curr_time), lcore, non_pkt_set_state);
++      // LATENCY DEBUG
++      // ts_start = rte_get_tsc_cycles();
++      num_expired = delete_expired_pkt_sets(RTE_PER_LCORE(curr_time), lcore, non_pkt_set_state);
++      // ts_end = rte_get_tsc_cycles();
++
+       // Announce quiescent state
+       // rte_rcu_qsbr_quiescent(rcu_lock, lcore);
+       rcu_quiescent_state();
+@@ -522,6 +559,25 @@ static int process_main(void* unused) {
+ 
+ #endif
+ 
++    // LATENCY DEBUG
++    /*
++    if (num_expired > 0 || received_count > 0) {
++      if (batch_id < MAX_NUM_DEBUG_LATENCY_RECORDS && (!sampling_cnt)) {
++        ts_end2 = rte_get_tsc_cycles();
++        debug_latency_records[batch_id].expiration_batch_latency = ts_end - ts_start;
++        debug_latency_records[batch_id].expiration_batch_size = num_expired;
++        debug_latency_records[batch_id].batch_latency = ts_end2 - ts_start;
++        debug_latency_records[batch_id].batch_size = received_count;
++        batch_id++;
++      }
++
++      // take 10% of the samples
++      sampling_cnt++;
++      if (sampling_cnt > 10)
++        sampling_cnt = 0;
++    }
++    */
++
+   VIGOR_LOOP_END
+ 
+   return 0;
+@@ -557,6 +613,80 @@ static int periodic_handler_main(void* unused) {
+   return 0;
+ }
+ 
++// LATENCY/PKT DROP DEBUG
++typedef struct debug_pkt_stat {
++  int num_drop;
++  int num_dequeued;
++  int fine_grained_stat_start_id;
++  int fine_grained_stat_end_id;
++} debug_pkt_stat_t;
++
++static debug_pkt_stat_t *debug_pkt_stats;
++static int debug_pkt_stats_ind = 0;
++
++static int *pkt_drop_data_fine_grained;
++static int *pkt_dequeued_data_fine_grained;
++static uint64_t *ts_fine_grained;
++
++static int pkt_drop_monitor_main(void* unused) {
++  int prev_drop_cnt = 0;
++  int prev_dequeued_cnt = 0;
++  debug_pkt_stats = calloc(10000, sizeof(debug_pkt_stat_t));
++  debug_pkt_stats_ind = 0;
++
++  int prev_drop_cnt_fine_grained = 0;
++  int prev_dequeued_cnt_fine_grained = 0;
++  pkt_drop_data_fine_grained = calloc(10000 * 1000, sizeof(int));
++  pkt_dequeued_data_fine_grained = calloc(10000 * 1000, sizeof(int));
++  ts_fine_grained = calloc(10000 * 1000, sizeof(uint64_t));
++  int debug_pkt_stats_fine_grained_ind = 0;
++
++  uint64_t period_start, period_end;
++  uint64_t duration = rte_get_tsc_hz() / 100; // 10ms
++
++  while (1) {
++    period_start = rte_get_tsc_cycles();
++
++    update_dev_stats(dev_stats, rte_eth_dev_count_avail());
++    int drop_cnt = dev_stats[0].imissed;
++    // NOTE:
++    // Use opackets here since there is some bug with ipackets (sometimes reporting negative difference)
++    // This is ok as long as we confirm total #ipackets = #opackets
++    int dequeued_cnt = dev_stats[1].opackets;
++    debug_pkt_stats[debug_pkt_stats_ind].num_drop = drop_cnt - prev_drop_cnt;
++    debug_pkt_stats[debug_pkt_stats_ind].num_dequeued = dequeued_cnt - prev_dequeued_cnt;
++    debug_pkt_stats_ind++;
++    prev_drop_cnt = drop_cnt;
++    prev_dequeued_cnt = dequeued_cnt;
++
++    // Get fine grained stat inds for next monitoring period
++    debug_pkt_stats[debug_pkt_stats_ind].fine_grained_stat_start_id = debug_pkt_stats_fine_grained_ind;
++    prev_drop_cnt_fine_grained = drop_cnt;
++    prev_dequeued_cnt_fine_grained = dequeued_cnt;
++
++    // Get fine grained stats for next monitoring period if we see any drops
++    period_end = rte_get_tsc_cycles();
++    while (period_end < period_start + duration) {
++      // if (debug_pkt_stats[debug_pkt_stats_ind - 1].num_drop > 0) {
++        // rte_delay_us_block(200);
++
++        ts_fine_grained[debug_pkt_stats_fine_grained_ind] = rte_get_tsc_cycles();
++
++        update_dev_stats(dev_stats, rte_eth_dev_count_avail());
++        int drop_cnt_fine_grained = dev_stats[0].imissed;
++        int dequeued_cnt_fine_grained = dev_stats[1].opackets;
++        pkt_drop_data_fine_grained[debug_pkt_stats_fine_grained_ind] = drop_cnt_fine_grained - prev_drop_cnt_fine_grained;
++        pkt_dequeued_data_fine_grained[debug_pkt_stats_fine_grained_ind++] = dequeued_cnt_fine_grained - prev_dequeued_cnt_fine_grained;
++        prev_drop_cnt_fine_grained = drop_cnt_fine_grained;
++        prev_dequeued_cnt_fine_grained = dequeued_cnt_fine_grained;
++      // }
++      period_end = rte_get_tsc_cycles();
++    }
++
++    // Get fine grained stat inds for next monitoring period
++    debug_pkt_stats[debug_pkt_stats_ind].fine_grained_stat_end_id = debug_pkt_stats_fine_grained_ind;
++  }
++}
+ 
+ #ifdef SIGTERM_HANDLING
+ // For debugging
+@@ -573,6 +703,7 @@ static void signal_handler(int signum) {
+     rte_eth_stats_get(port, &dev_stats[port]);
+     printf("port%d:\n", port);
+     printf("ipackets: %ld\n", dev_stats[port].ipackets);
++    printf("opackets: %ld\n", dev_stats[port].ipackets);
+     printf("imissed: %ld\n", dev_stats[port].imissed);
+     printf("ierrors: %ld\n", dev_stats[port].ierrors);
+     printf("rx_nombuf: %ld\n", dev_stats[port].rx_nombuf);
+@@ -583,6 +714,45 @@ static void signal_handler(int signum) {
+     fflush(stdout);
+   }
+ 
++  // DEBUG Pkt drop
++  printf("\n#pkts offered/drop per 10msec:\n");
++
++  double tsc_hz = (double) rte_get_tsc_hz();
++  // check if timestamp aligned with trace-cmd
++  printf("monitor start: pid %d ts %.6f\n", monitor_pid, (double)monitor_start / tsc_hz);
++
++  for (int i = 0; i < debug_pkt_stats_ind; i++) {
++    debug_pkt_stat_t *stat = debug_pkt_stats + i;
++    printf("%d %d %d\n", i, stat->num_drop + stat->num_dequeued, stat->num_drop);
++    for (int j = stat->fine_grained_stat_start_id; j < stat->fine_grained_stat_end_id; j++) {
++      double ts = ts_fine_grained[j] / tsc_hz;
++      printf("%d %d %.6f %d %d\n", i, j, ts, pkt_dequeued_data_fine_grained[j], pkt_drop_data_fine_grained[j]);
++    }
++  }
++  fflush(stdout);
++
++  // DEBUG Latency
++  /*
++  uint64_t tsc_freq = rte_get_tsc_hz(); 
++  printf("\nProcessing latency profile:\n");
++  int num_pkts_cnted = 0;
++  for (int i = 0; i < batch_id; i++) {
++    uint64_t batch_latency = (1000 * 1000 * 1000) *
++                             (uint64_t) debug_latency_records[i].batch_latency /
++                             tsc_freq;
++    uint64_t expiration_batch_latency = (1000 * 1000 * 1000) *
++                             (uint64_t) debug_latency_records[i].expiration_batch_latency /
++                             tsc_freq;
++    printf("%ld %d %ld %d\n", batch_latency,
++                          debug_latency_records[i].batch_size,
++                          expiration_batch_latency,
++                          debug_latency_records[i].expiration_batch_size);
++    num_pkts_cnted += debug_latency_records[i].batch_size;
++  }
++  printf("num_pkts_cnted: %d\n", num_pkts_cnted);
++  fflush(stdout);
++  */
++
+ #ifdef ENABLE_LOG
+   // flush and clean up logs
+   logging_fini(rte_lcore_count());
+@@ -692,7 +862,7 @@ int main() {
+   lcore_funcs[lcore] = flow_bench_main;
+ #else
+ #ifndef LOAD_BALANCING
+-  lcore_funcs[lcore] = periodic_handler_main;
++  lcore_funcs[lcore] = pkt_drop_monitor_main;
+ #else
+   lcore_funcs[lcore] = lb_main;
+   lb_init(num_lcores - 1);
+@@ -719,6 +889,9 @@ int main() {
+   // Init dev_stats
+   dev_stats = calloc(nb_devices, sizeof(struct rte_eth_stats));
+ 
++  // Init latency debug counters
++  // debug_latency_records = calloc(MAX_NUM_DEBUG_LATENCY_RECORDS, sizeof(debug_latency_record_t));
++
+   rte_eal_mp_remote_launch(lcore_entry, (void*)lcore_funcs, CALL_MASTER);
+   rte_eal_mp_wait_lcore();
+ 

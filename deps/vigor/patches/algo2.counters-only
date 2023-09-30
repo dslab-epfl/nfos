@@ -1,0 +1,226 @@
+diff --git a/nf-lb/lb.c b/nf-lb/lb.c
+index b344dc7a..da54a3cf 100644
+--- a/nf-lb/lb.c
++++ b/nf-lb/lb.c
+@@ -46,14 +46,6 @@ struct nf_cycle_cnt* cores_nf_cycle_cnt;
+ 
+ // For synchronizing workers upon new reta
+ uint16_t new_reta[NUM_FLOW_PARTITIONS];
+-volatile int migration_sync;
+-
+-// Rings for dispatching pkts of migrated flows from src core to dst core
+-// One for each {core, port}
+-struct rte_ring** work_rings;
+-// Rings for returning pkts of migrated flows back from dst core to src core
+-// One for each {core, port}
+-struct rte_ring** work_done_rings;
+ 
+ #ifdef DRIVER_COST_MEASUREMENT
+ aligned_uint64_t* driver_cycles_cnter;
+@@ -83,35 +75,12 @@ int lb_init(int num_cores) {
+     // For synchronizing workers upon new reta
+     // assume port 0 is lan device
+     get_rss_reta(0, new_reta);
+-    migration_sync = 0;
+-    // including the monitoring core
+-    barrier_init(num_cores + 1);
+-
+     // DEBUG
+     // for (int i = 0; i < NUM_FLOW_PARTITIONS / 4; i++) {
+     //     if (i % 2 == 0)
+     //         new_reta[i] = 3 - new_reta[i];
+     // }
+ 
+-    // Init work_ring/work_done_ring
+-    // TODO: free
+-    int num_ports = rte_eth_dev_count_avail();
+-    work_rings = calloc(num_cores * num_ports, sizeof(struct rte_ring*));
+-    work_done_rings = calloc(num_cores * num_ports, sizeof(struct rte_ring*));
+-    for (int port = 0; port < num_ports; port++) {
+-        for (int core = 0; core < num_cores; core++) {
+-            char work_ring_name[128];
+-            sprintf(work_ring_name, "work_ring_%d_%d", port, core);
+-            work_rings[port * num_cores + core] = rte_ring_create(work_ring_name,
+-                    WORK_RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
+-
+-            char work_done_ring_name[128];
+-            sprintf(work_done_ring_name, "work_done_ring_%d_%d", port, core);
+-            work_done_rings[port * num_cores + core] = rte_ring_create(work_done_ring_name,
+-                    WORK_RING_SIZE, rte_socket_id(), RING_F_SC_DEQ);
+-        }
+-    }
+-
+ #ifdef DRIVER_COST_MEASUREMENT
+     driver_cycles_cnter = calloc(num_cores, sizeof(aligned_uint64_t));
+ #endif
+@@ -303,21 +272,11 @@ int lb_main(void* unused) {
+ #ifdef ENABLE_LOG
+             memcpy(old_reta_debug, new_reta, NUM_FLOW_PARTITIONS * sizeof(uint16_t));
+ #endif
+-            if (is_reta_update_needed) {
+-                // set migration flag
+-                migration_sync = 1;
+-                barrier_wait();
+-
++            if (is_reta_update_needed > 1) {
+                 // updating reta
+                 for (int i = 0; i < NUM_FLOW_PARTITIONS; i++)
+                     new_reta[i] = flow_partitions[i].core;
+-                // reset migration flag
+-                migration_sync = 0;
+-
+-                barrier_wait();
+-                // all worker cores will process flows
+-                // based on the new reta at this point
+-                
++               
+                 // hard-coded reta size for now
+                 for (int port = 0; port < num_ports; port++) {
+                     set_rss_reta(port, new_reta, NUM_FLOW_PARTITIONS);
+diff --git a/nf-lb/lb.h b/nf-lb/lb.h
+index 1347b421..af8c3858 100644
+--- a/nf-lb/lb.h
++++ b/nf-lb/lb.h
+@@ -26,10 +26,6 @@ extern struct nf_cycle_cnt* cores_nf_cycle_cnt;
+ extern int monitoring_epoch;
+ 
+ extern uint16_t new_reta[NUM_FLOW_PARTITIONS];
+-extern volatile int migration_sync;
+-
+-extern struct rte_ring** work_rings;
+-extern struct rte_ring** work_done_rings;
+ 
+ // #define DRIVER_COST_MEASUREMENT
+ #ifdef DRIVER_COST_MEASUREMENT
+diff --git a/nf.c b/nf.c
+index cc84403e..87b94465 100644
+--- a/nf.c
++++ b/nf.c
+@@ -348,13 +348,6 @@ static int process_main(void* unused) {
+   VIGOR_LOOP_BEGIN
+     // Try to expire one partition per vigor loop iteration
+ #ifdef LOAD_BALANCING
+-    // sync all workers to make sure they see the new_reta
+-    // after this point
+-    if (migration_sync) {
+-      barrier_wait();
+-      barrier_wait();
+-    }
+-
+     uint16_t partition_owner = new_reta[partition_to_expire];
+     if (partition_owner == lcore)
+       nf_expire_allocated_ind(VIGOR_NOW, partition_to_expire);
+@@ -388,31 +381,7 @@ static int process_main(void* unused) {
+       // Assume num_partitions is power of two
+ #ifdef LOAD_BALANCING
+ 
+-      // sync all workers to make sure they see the new_reta
+-      // after this point
+-      // do here also to minimize waiting time of lcores
+-      if (migration_sync) {
+-        barrier_wait();
+-        barrier_wait();
+-      }
+-
+       uint16_t partition = mbufs[n]->hash.rss & 127;
+-
+-      // pkt belongs to a migrated flow
+-      // forward it to the right core
+-      if (new_reta[partition] != lcore) {
+-        struct rte_ring* dst_work_ring = work_rings[VIGOR_DEVICE * num_queues + new_reta[partition]];
+-
+-        // drop pkt if no space in the queue
+-        // should not happen since the hardware reta will
+-        // be updated soon and no more pkts will be queued here afterwards...
+-        if (rte_ring_mp_enqueue(dst_work_ring, mbufs[n])) {
+-          rte_pktmbuf_free(mbufs[n]);
+-        }
+-
+-        continue;
+-      }
+-
+       cores_nf_pkt_cnt[lcore].pkt_cnt[monitoring_epoch][partition]++;
+ #else
+       uint16_t partition = lcore;
+@@ -444,72 +413,6 @@ static int process_main(void* unused) {
+ 
+     // End of vigor loop iter in common case
+ 
+-#ifdef LOAD_BALANCING
+-    // poll packets from the work_ring
+-    // do the processing and return them to the src core
+-    struct rte_ring* work_ring = work_rings[VIGOR_DEVICE * num_queues + lcore];
+-
+-    if (!rte_ring_empty(work_ring)) {
+-      // poll for packets
+-      struct rte_mbuf* mbufs[VIGOR_BATCH_SIZE];
+-      int work_count = rte_ring_sc_dequeue_burst(work_ring, (void**)mbufs,
+-                                                VIGOR_BATCH_SIZE, NULL);
+-
+-      timer_start = get_rdtscp_cycles();
+-
+-      for (int i = 0; i < work_count; i++) {
+-        struct rte_mbuf* mbuf = mbufs[i];
+-        uint16_t partition = mbuf->hash.rss & 127;
+-        uint16_t src_device = mbuf->port;
+-        uint16_t dst_device;
+-        // See mempool creation in main for a description of this hack
+-        int src_core = mbuf->pool->name[0];
+-
+-        cores_nf_pkt_cnt[lcore].pkt_cnt[monitoring_epoch][partition]++;
+-
+-        // processing the packet
+-        uint8_t* packet = rte_pktmbuf_mtod(mbuf, uint8_t*);
+-        packet_state_total_length(packet, &(mbuf->pkt_len));
+-        dst_device = nf_process(src_device, packet,
+-                                mbuf->data_len, VIGOR_NOW, partition);
+-        nf_return_all_chunks(packet);
+-
+-        // Drop pkt if src_dev == dst_dev
+-        if (dst_device == src_device) {
+-          rte_pktmbuf_free(mbuf);
+-        } else {
+-          // return the processed packet to the src core
+-          struct rte_ring* dst_work_done_ring = work_done_rings[VIGOR_DEVICE * num_queues + src_core];
+-          // drop pkt if no space in the queue
+-          // should not happen since the hardware reta will
+-          // be updated soon and no more pkts will be queued here afterwards...
+-          if (rte_ring_mp_enqueue(dst_work_done_ring, mbuf)) {
+-            rte_pktmbuf_free(mbuf);
+-          }
+-        }
+-      }
+-
+-      cores_nf_cycle_cnt[lcore].cycle_cnt[monitoring_epoch] += get_rdtscp_cycles() - timer_start;
+-
+-    }
+-
+-    // Poll packets from the work_done_ring and tx it to the NIC
+-    struct rte_ring* work_done_ring = work_done_rings[VIGOR_DEVICE * num_queues + lcore];
+-
+-    if (!rte_ring_empty(work_done_ring)) {
+-      // poll for packets
+-      struct rte_mbuf* mbufs[VIGOR_BATCH_SIZE];
+-      int work_count = rte_ring_sc_dequeue_burst(work_done_ring, (void**)mbufs,
+-                                                VIGOR_BATCH_SIZE, NULL);
+-
+-      // tx to NIC
+-      uint16_t sent_count = rte_eth_tx_burst(1 - VIGOR_DEVICE, lcore, mbufs, work_count);
+-      for (uint16_t n = sent_count; n < work_count; n++) {
+-        rte_pktmbuf_free(mbufs[n]); // should not happen, but we're in the unverified case anyway
+-      }
+-    }
+-
+-#endif
+ 
+   VIGOR_LOOP_END
+ 
+@@ -712,7 +615,7 @@ int MAIN(int argc, char *argv[]) {
+ #ifndef LOAD_BALANCING
+   lcore_funcs[lcore] = idle_main;
+ #else
+-  lcore_funcs[lcore] = lb_main;
++  lcore_funcs[lcore] = idle_main;
+   lb_init(num_lcores - 1);
+ #endif
+ #endif

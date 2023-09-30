@@ -1,0 +1,17 @@
+dist: bionic
+language: minimal
+
+services:
+  - docker
+
+before_install:
+  - docker pull dslabepfl/vigor
+
+install:
+  - docker run -dt --name=vigor dslabepfl/vigor
+  - docker exec vigor rm -rf /home/vigor/vigor
+  - docker cp . vigor:/home/vigor/vigor
+  - docker exec vigor sudo chown -R vigor:vigor /home/vigor/vigor
+
+script:
+  - docker exec vigor /bin/bash -c 'cd vigor && . .travis-test.sh'

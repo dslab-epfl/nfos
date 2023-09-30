@@ -1,0 +1,431 @@
+diff --git a/nf-lb/lb.c b/nf-lb/lb.c
+index 3c722d95..b344dc7a 100644
+--- a/nf-lb/lb.c
++++ b/nf-lb/lb.c
+@@ -16,9 +16,10 @@
+ #include "nf-lb/lb_algo.h"
+ #include "nf-lb/barrier.h"
+ 
++// debug
+ #ifdef ENABLE_LOG
+-#include "nf-log.h"
+ #include "libvig/verified/vigor-time.h"
++#include "nf-log.h"
+ #endif
+ 
+ #define NUM_DESCS 128
+@@ -40,6 +41,9 @@ static int num_queues;
+ struct nf_pkt_cnt* cores_nf_pkt_cnt;
+ int monitoring_epoch;
+ 
++// per-core cpu cycles counter (useful cycles for NF process, not including polling)
++struct nf_cycle_cnt* cores_nf_cycle_cnt;
++
+ // For synchronizing workers upon new reta
+ uint16_t new_reta[NUM_FLOW_PARTITIONS];
+ volatile int migration_sync;
+@@ -51,6 +55,10 @@ struct rte_ring** work_rings;
+ // One for each {core, port}
+ struct rte_ring** work_done_rings;
+ 
++#ifdef DRIVER_COST_MEASUREMENT
++aligned_uint64_t* driver_cycles_cnter;
++#endif
++
+ static int lb_triggered(int* rxq_len, int* prev_rxq_len, int num_rxq) {
+     int i;
+     for (i = 0; i < num_rxq; i++) {
+@@ -67,6 +75,9 @@ int lb_init(int num_cores) {
+     // TODO: Free
+     cores_nf_pkt_cnt = rte_calloc(NULL, num_cores, sizeof(struct nf_pkt_cnt), 0);
+ 
++    // TODO: free
++    cores_nf_cycle_cnt = rte_calloc(NULL, num_cores, sizeof(struct nf_cycle_cnt), 0);
++
+     monitoring_epoch = 0;
+ 
+     // For synchronizing workers upon new reta
+@@ -101,12 +112,16 @@ int lb_init(int num_cores) {
+         }
+     }
+ 
++#ifdef DRIVER_COST_MEASUREMENT
++    driver_cycles_cnter = calloc(num_cores, sizeof(aligned_uint64_t));
++#endif
++
+     return 0;
+ }
+ 
+ #ifdef ENABLE_LOG
+ static void lb_log(int* curr_rxq_len, int* prev_rxq_len, int* rxq_len_diff,
+-                   int* core_counted_pkts,
++                   int* core_counted_pkts, int* core_counted_cycles,
+                    uint16_t* old_reta, int* partition_counted_pkts,
+                    struct core* cores, struct partition* flow_partitions,
+                    int is_reta_updated, int num_partitions,
+@@ -120,15 +135,19 @@ static void lb_log(int* curr_rxq_len, int* prev_rxq_len, int* rxq_len_diff,
+                            prev_rxq_len[i + port * num_queues]);
+         }                
+         NF_DEBUG("core %d rxq_len_diff: %d", i, rxq_len_diff[i]);
+-        NF_DEBUG("core %d counted_pkts %d est. offered_load %d",
+-                  i, core_counted_pkts[i], cores[i].offered_load);
++        NF_DEBUG("core %d counted_cycles %d counted_pkts %d est. offered_CPU_load %d",
++                  i, core_counted_cycles[i], core_counted_pkts[i], cores[i].offered_load);
+     }
+ 
++    /* disabled due to too much overhead */
+     // partition stats
+     // for (int i = 0; i < num_partitions; i++) {
+     //     int core = old_reta[i];
+-    //     NF_DEBUG("P %d counted_pkts %d est. offered_load %d src_core %d dst_core %d",
+-    //               i, partition_counted_pkts[i], flow_partitions[i].offered_load,
++    //     float est_pkts = (float) flow_partitions[i].offered_load 
++    //                    * (float) core_counted_pkts[core]
++    //                    / (float) cores[core].offered_load;
++    //     NF_DEBUG("P %d counted_pkts %d est. pkts %f est. offered_CPU_load %d src_core %d dst_core %d",
++    //               i, partition_counted_pkts[i], est_pkts, flow_partitions[i].offered_load,
+     //               core, flow_partitions[i].core);
+     // }
+ 
+@@ -136,7 +155,6 @@ static void lb_log(int* curr_rxq_len, int* prev_rxq_len, int* rxq_len_diff,
+ }
+ #endif
+ 
+-
+ int lb_main(void* unused) {
+ 
+ #ifdef ENABLE_LOG
+@@ -157,6 +175,8 @@ int lb_main(void* unused) {
+     // if we still use #pkts/sec as metric for load
+     // the current way of integrating rxq_len_diff in load is inaccurate...
+     int* rxq_len_diff = calloc(num_queues, sizeof(int));
++    float* core_cycles = calloc(num_queues, sizeof(float));
++
+     struct partition flow_partitions[NUM_FLOW_PARTITIONS];
+     struct core* cores = calloc(num_queues, sizeof(struct core));
+ 
+@@ -167,6 +187,7 @@ int lb_main(void* unused) {
+ #ifdef ENABLE_LOG
+     int* prev_rxq_len_debug = calloc(num_queues * num_ports, sizeof(int));
+     int* core_counted_pkts_debug = calloc(num_queues, sizeof(int));
++    int* core_counted_cycles_debug = calloc(num_queues, sizeof(int));
+     uint16_t old_reta_debug[NUM_FLOW_PARTITIONS];
+     int partition_counted_pkts_debug[NUM_FLOW_PARTITIONS];
+     uint64_t tsc_mhz = rte_get_tsc_hz() / 1000 / 1000;
+@@ -207,6 +228,7 @@ int lb_main(void* unused) {
+         }
+ 
+         is_lb_triggered = lb_triggered(curr_rxq_len, prev_rxq_len, num_queues * num_ports);
++
+         if (is_lb_triggered) {
+             // Get goodput on partitions & cores
+             for (int i = 0; i < num_queues; i++) {
+@@ -234,17 +256,37 @@ int lb_main(void* unused) {
+             }
+ #endif
+ 
+-            // Get offered load on partitions & cores
++            // Get cycles on cores & partitions, taking into account
++            // rxq_len_diff
++            for (int i = 0; i < num_queues; i++) {
++                float counted_cycles = cores_nf_cycle_cnt[i].cycle_cnt[prev_monitoring_epoch];
++#ifdef ENABLE_LOG
++                core_counted_cycles_debug[i] = counted_cycles;
++#endif
++                float extra_cycles = 0;
++                // 240: minimal number of tsc cycles spent in driver per packet
++                float driver_cycles = (rxq_len_diff[i] + cores[i].offered_load) * 240;
++                if (cores[i].offered_load) {
++                    extra_cycles = ((float) rxq_len_diff[i] / (float) cores[i].offered_load)
++                                   * counted_cycles;
++                    core_cycles[i] = counted_cycles + extra_cycles + driver_cycles;
++                } else {
++                    core_cycles[i] = 0;
++                }
++
++                //this could happen when extra_cycles < 0
++                if (core_cycles[i] < 0)
++                    core_cycles[i] = 0;
++            }
++
+             for (int i = 0; i < NUM_FLOW_PARTITIONS; i++) {
+                 uint16_t core = flow_partitions[i].core;
+-                int goodput = flow_partitions[i].offered_load;
+-                if (cores[core].offered_load) {
+-                    flow_partitions[i].offered_load +=
+-                                                (goodput * rxq_len_diff[core]) /
+-                                                 cores[core].offered_load;
++                float goodput = flow_partitions[i].offered_load;
++                float total_goodput = cores[core].offered_load;
++                if (total_goodput != 0) {
++                    flow_partitions[i].offered_load = (goodput / total_goodput)
++                                                      * core_cycles[core];
+                 }
+-                if (flow_partitions[i].offered_load < 0)
+-                    flow_partitions[i].offered_load = 0;
+             }
+             for (int i = 0; i < num_queues; i++) {
+                 cores[i].offered_load = 0;
+@@ -261,7 +303,6 @@ int lb_main(void* unused) {
+ #ifdef ENABLE_LOG
+             memcpy(old_reta_debug, new_reta, NUM_FLOW_PARTITIONS * sizeof(uint16_t));
+ #endif
+-
+             if (is_reta_update_needed) {
+                 // set migration flag
+                 migration_sync = 1;
+@@ -288,10 +329,12 @@ int lb_main(void* unused) {
+ #endif
+ 
+             // reset queue length monitor and per-partition packet counter
++            // , and per-core cpu cycles counter
+             for (int core = 0; core < num_queues; core++) {
+                 for (int i = 0; i < NUM_FLOW_PARTITIONS; i++) {
+                     cores_nf_pkt_cnt[core].pkt_cnt[prev_monitoring_epoch][i] = 0;
+                 }
++                cores_nf_cycle_cnt[core].cycle_cnt[prev_monitoring_epoch] = 0;
+             }
+ 
+             prev_monitoring_epoch = monitoring_epoch;
+@@ -308,17 +351,19 @@ int lb_main(void* unused) {
+         }
+ 
+         // reset per-partition packet counter for next epoch
++        // , and per-core cpu cycles counter
+         for (int core = 0; core < num_queues; core++) {
+             for (int i = 0; i < NUM_FLOW_PARTITIONS; i++) {
+                 cores_nf_pkt_cnt[core].pkt_cnt[prev_monitoring_epoch][i] = 0;
+             }
++            cores_nf_cycle_cnt[core].cycle_cnt[prev_monitoring_epoch] = 0;
+         }
+ 
+ #ifdef ENABLE_LOG
+         if (is_lb_triggered) {
+             uint64_t timer_start = rte_get_tsc_cycles();
+             lb_log(prev_rxq_len, prev_rxq_len_debug, rxq_len_diff,
+-                   core_counted_pkts_debug,
++                   core_counted_pkts_debug, core_counted_cycles_debug,
+                    old_reta_debug, partition_counted_pkts_debug,
+                    cores, flow_partitions,
+                    is_reta_update_needed, NUM_FLOW_PARTITIONS,
+diff --git a/nf-lb/lb.h b/nf-lb/lb.h
+index 486eb22f..1347b421 100644
+--- a/nf-lb/lb.h
++++ b/nf-lb/lb.h
+@@ -11,12 +11,18 @@ struct nf_pkt_cnt {
+     uint16_t pkt_cnt[2][NUM_FLOW_PARTITIONS];
+ } __attribute__ ((aligned(64)));
+ 
++struct nf_cycle_cnt {
++    int cycle_cnt[2];
++} __attribute__ ((aligned(64)));
++
+ struct partitions {
+     int num_partitions;
+     uint16_t inds[NUM_FLOW_PARTITIONS];
+ } __attribute__ ((aligned(64)));
+ 
+ extern struct nf_pkt_cnt* cores_nf_pkt_cnt;
++extern struct nf_cycle_cnt* cores_nf_cycle_cnt;
++
+ extern int monitoring_epoch;
+ 
+ extern uint16_t new_reta[NUM_FLOW_PARTITIONS];
+@@ -25,6 +31,12 @@ extern volatile int migration_sync;
+ extern struct rte_ring** work_rings;
+ extern struct rte_ring** work_done_rings;
+ 
++// #define DRIVER_COST_MEASUREMENT
++#ifdef DRIVER_COST_MEASUREMENT
++typedef uint64_t aligned_uint64_t __attribute__ ((aligned(64)));
++extern aligned_uint64_t* driver_cycles_cnter; 
++#endif
++
+ int lb_init(int num_cores);
+ int lb_main(void* unused);
+ int lb_qlen_microbench(void* unused);
+diff --git a/nf.c b/nf.c
+index 2331ae0d..cc84403e 100644
+--- a/nf.c
++++ b/nf.c
+@@ -21,6 +21,7 @@
+ #include <rte_mbuf.h>
+ #include <rte_flow.h>
+ #include <rte_ring.h>
++#include <rte_cycles.h>
+ 
+ #include "libvig/verified/boilerplate-util.h"
+ #include "libvig/verified/packet-io.h"
+@@ -197,6 +198,24 @@ static int nf_init_device(uint16_t device, struct rte_mempool **mbuf_pools, uint
+   return 0;
+ }
+ 
++static inline uint64_t
++get_rdtscp_cycles(void)
++{
++	union {
++		uint64_t tsc_64;
++		struct {
++			uint32_t lo_32;
++			uint32_t hi_32;
++		};
++	} tsc;
++
++	asm volatile("rdtscp" :
++		     "=a" (tsc.lo_32),
++		     "=d" (tsc.hi_32)
++         :: "ecx");
++	return tsc.tsc_64;
++}
++
+ // --- Per-core work ---
+ 
+ // entry function to various NF threads, a bit ugly...
+@@ -321,8 +340,11 @@ static int process_main(void* unused) {
+ 
+ #ifdef LOAD_BALANCING
+   int partition_to_expire = 0;
++  uint64_t timer_start;
+ #endif
+ 
++#ifndef DRIVER_COST_MEASUREMENT
++
+   VIGOR_LOOP_BEGIN
+     // Try to expire one partition per vigor loop iteration
+ #ifdef LOAD_BALANCING
+@@ -348,6 +370,11 @@ static int process_main(void* unused) {
+     int mbuf_send_index = 0;
+     uint16_t received_count = rte_eth_rx_burst(VIGOR_DEVICE, lcore, mbufs, VIGOR_BATCH_SIZE);
+ 
++#ifdef LOAD_BALANCING
++    if (received_count)
++      timer_start = get_rdtscp_cycles();
++#endif
++
+ #ifdef FLOW_PERF_BENCH
+     // Intel's software counter seems broken... Do it manually here
+     // Used for NIC flow engine (flow rules, RSS, ...) benchmarking
+@@ -404,6 +431,12 @@ static int process_main(void* unused) {
+       }
+     }
+ 
++#ifdef LOAD_BALANCING
++    if (received_count) {
++      cores_nf_cycle_cnt[lcore].cycle_cnt[monitoring_epoch] += get_rdtscp_cycles() - timer_start;
++    }
++#endif
++
+     uint16_t sent_count = rte_eth_tx_burst(1 - VIGOR_DEVICE, lcore, mbufs_to_send, mbuf_send_index);
+     for (uint16_t n = sent_count; n < mbuf_send_index; n++) {
+       rte_pktmbuf_free(mbufs[n]); // should not happen, but we're in the unverified case anyway
+@@ -421,6 +454,9 @@ static int process_main(void* unused) {
+       struct rte_mbuf* mbufs[VIGOR_BATCH_SIZE];
+       int work_count = rte_ring_sc_dequeue_burst(work_ring, (void**)mbufs,
+                                                 VIGOR_BATCH_SIZE, NULL);
++
++      timer_start = get_rdtscp_cycles();
++
+       for (int i = 0; i < work_count; i++) {
+         struct rte_mbuf* mbuf = mbufs[i];
+         uint16_t partition = mbuf->hash.rss & 127;
+@@ -452,6 +488,9 @@ static int process_main(void* unused) {
+           }
+         }
+       }
++
++      cores_nf_cycle_cnt[lcore].cycle_cnt[monitoring_epoch] += get_rdtscp_cycles() - timer_start;
++
+     }
+ 
+     // Poll packets from the work_done_ring and tx it to the NIC
+@@ -473,7 +512,70 @@ static int process_main(void* unused) {
+ #endif
+ 
+   VIGOR_LOOP_END
+-#endif
++
++#else // DRIVER_COST_MEASUREMENT
++
++/* 
++ * Dirty code for driver cost measurement
++ * driver cycle (tsc) of packet =
++ * total cycle (tsc) of packet - nf cycle (tsc) of packet
++ */
++
++  VIGOR_LOOP_BEGIN
++    // uint64_t timer_start = get_rdtscp_cycles();
++
++    // Try to expire one partition per vigor loop iteration
++    uint16_t partition_owner = new_reta[partition_to_expire];
++    if (partition_owner == lcore)
++      nf_expire_allocated_ind(VIGOR_NOW, partition_to_expire);
++    partition_to_expire++;
++    if (partition_to_expire > NUM_FLOW_PARTITIONS)
++      partition_to_expire = 0;
++
++    struct rte_mbuf *mbufs[VIGOR_BATCH_SIZE];
++    struct rte_mbuf *mbufs_to_send[VIGOR_BATCH_SIZE];
++    int mbuf_send_index = 0;
++    uint16_t received_count = rte_eth_rx_burst(VIGOR_DEVICE, lcore, mbufs, VIGOR_BATCH_SIZE);
++
++    uint64_t timer_start = get_rdtscp_cycles();
++    // if (received_count)
++    //   driver_cycles_cnter[lcore] += get_rdtscp_cycles() - timer_start;
++
++
++    for (uint16_t n = 0; n < received_count; n++) {
++
++      uint16_t partition = mbufs[n]->hash.rss & 127;
++
++      uint8_t* packet = rte_pktmbuf_mtod(mbufs[n], uint8_t*);
++      packet_state_total_length(packet, &(mbufs[n]->pkt_len));
++      uint16_t dst_device = nf_process(mbufs[n]->port, packet, mbufs[n]->data_len, VIGOR_NOW, partition);
++      nf_return_all_chunks(packet);
++
++      if (dst_device == VIGOR_DEVICE) {
++        rte_pktmbuf_free(mbufs[n]);
++      } else { // includes flood when 2 devices, which is equivalent to just a send
++        mbufs_to_send[mbuf_send_index] = mbufs[n];
++        mbuf_send_index++;
++      }
++    }
++
++    uint64_t timer_end = get_rdtscp_cycles();
++    if (received_count && (VIGOR_DEVICE==1))
++      driver_cycles_cnter[lcore] += timer_end - timer_start;
++    // uint64_t timer_start = get_rdtscp_cycles();
++
++    uint16_t sent_count = rte_eth_tx_burst(1 - VIGOR_DEVICE, lcore, mbufs_to_send, mbuf_send_index);
++    for (uint16_t n = sent_count; n < mbuf_send_index; n++) {
++      rte_pktmbuf_free(mbufs_to_send[n]); // should not happen, but we're in the unverified case anyway
++    }
++ 
++    // if (received_count)
++    //   driver_cycles_cnter[lcore] += get_rdtscp_cycles() - timer_start;
++  VIGOR_LOOP_END
++
++#endif // DRIVER_COST_MEASUREMENT
++
++#endif // VIGOR_BATCH_SIZE == 1 
+ 
+   return 0;
+ }
+@@ -503,6 +605,18 @@ static void signal_handler(int signum) {
+     fflush(stdout);
+   }
+ 
++#ifdef DRIVER_COST_MEASUREMENT
++  uint64_t total_ipackets = 0;
++  for (int port = 0; port < nb_devices; port++)
++    total_ipackets += dev_stats[port].ipackets;
++  uint64_t total_driver_cycles = 0;
++  for (int i = 0; i < rte_lcore_count()-1; i++)
++    total_driver_cycles += driver_cycles_cnter[i]; 
++  printf("cycles: %ld, pkts: %ld, cycles per pkt: %ld\n",
++        total_driver_cycles, total_ipackets, total_driver_cycles / total_ipackets);
++  fflush(stdout);
++#endif
++
+ #ifdef ENABLE_LOG
+   // flush and clean up logs
+   logging_fini(rte_lcore_count());

@@ -1,0 +1,14 @@
+{
+  "config": [
+    {
+      "device category": "LAN",
+      "devices": [0],
+      "id fields": ["dstIP", "dstPort", "protocol"]
+    },
+    {
+      "device category": "WAN",
+      "devices": [1],
+      "id fields": ["srcIP", "srcPort", "protocol"]
+    }
+  ]
+}

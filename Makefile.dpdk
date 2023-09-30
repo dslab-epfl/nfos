@@ -1,0 +1,140 @@
+# This Makefile expects to be included from the shared one
+# Skeleton Makefile for NFOS NFs
+
+## Paths
+# get current dir, see https://stackoverflow.com/a/8080530
+SELF_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+VIGOR_DIR := $(SELF_DIR)/deps/vigor
+
+## DPDK stuff
+# DPDK uses pkg-config to simplify app building process since version 20.11
+# check existance of the DPDK pkg-config
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+$(error "no installation of DPDK found")
+endif
+
+PKGCONF ?= pkg-config
+PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
+CFLAGS += $(shell $(PKGCONF) --cflags libdpdk)
+LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
+
+# allow the use of advanced globs in paths
+SHELL := /bin/bash -O extglob -O globstar -c
+
+## Source files
+# somehow because of DPDK makefile magic wildcards mess up everything here,
+# so we ask echo to expand those
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/double-chain*.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/map.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/vector.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/vigor-time.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/packet-io.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/expirator.c)
+#SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/ether.c)
+SRCS-y += $(shell echo $(VIGOR_DIR)/libvig/verified/*.c)
+SRCS-y += $(shell echo $(VIGOR_DIR)/nf-lb/rss.c)
+SRCS-y += $(shell echo $(VIGOR_DIR)/nf-util.c)
+SRCS-y += $(shell echo $(VIGOR_DIR)/nf-log.c)
+SRCS-y += $(shell echo $(SELF_DIR)/src/*.c)
+SRCS-y += $(shell echo $(SELF_DIR)/utils/pkt-drop-lat-monitor.c)
+# The common dir should be eventually moved to NF makefile
+SRCS-y += $(shell echo $(SELF_DIR)/nf/common/*.c)
+SRCS-y += $(NF_FILES)
+
+## Compiler flags
+# The common dir contains fib related data structures which would be eventually moved to NF makefile
+CFLAGS += -I $(SELF_DIR) -I $(SELF_DIR)/src/include -I $(SELF_DIR)/deps -I $(SELF_DIR)/nf/common
+CFLAGS += -I $(NF_INCLUDE_PATH)
+CFLAGS += -I $(VIGOR_DIR)
+CFLAGS += -std=gnu11
+CFLAGS += -DCAPACITY_POW2
+CFLAGS += -O3 -flto
+#CFLAGS += -O0 -g -rdynamic -DENABLE_LOG -Wfatal-errors
+# GCC optimizes a checksum check in rte_ip.h into a CMOV, which is a very poor choice
+# that causes 99th percentile latency to go through the roof;
+# force it to not do that with no-if-conversion
+ifeq ($(CC),gcc)
+CFLAGS += -fno-if-conversion -fno-if-conversion2
+endif
+# cores to use
+LCORES ?= 8,10,12,14,16
+CFLAGS += -DLCORES='"$(LCORES)"'
+# pkt set expiration time, default 1.2 sec
+EXP_TIME ?= 1200000
+CFLAGS += -DEXPIRATION_TIME=$(EXP_TIME)
+MAX_NUM_PKT_SETS ?= 1369000
+CFLAGS += -DMAX_NUM_PKT_SETS=$(MAX_NUM_PKT_SETS)
+
+## Link flags
+LDFLAGS += -L$(SELF_DIR)/deps/mv-rlu/lib -lmvrlu-ordo
+
+## Targets
+.PHONY: nf nf-scal-profile nf-debug nf-debug-log clean
+# NF binary target,
+# make it clean every time because our dependency tracking is nonexistent...
+nf: clean $(SRCS-y)
+	@mkdir -p build/app
+	$(CC) $(CFLAGS) $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+
+nf-scal-profile: clean $(SRCS-y)
+	@mkdir -p build/app
+	@pushd $(SELF_DIR)/deps/mv-rlu/lib; make clean; make libmvrlu-ordo.a CC=gcc-8 MVRLU_PROFILER=true; popd
+	$(CC) $(CFLAGS) -DSCALABILITY_PROFILER $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+	@pushd $(SELF_DIR)/deps/mv-rlu/lib; make clean; make libmvrlu-ordo.a CC=gcc-8; popd
+
+nf-debug: clean $(SRCS-y)
+	@mkdir -p build/app
+	$(CC) $(CFLAGS) -g -ggdb $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+
+nf-debug-log: clean $(SRCS-y)
+	@mkdir -p build/app
+	$(CC) $(CFLAGS) -g -ggdb -DENABLE_LOG $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+
+nf-debug-stat-log: clean $(SRCS-y)
+	@mkdir -p build/app
+	$(CC) $(CFLAGS) -g -ggdb -DENABLE_STAT $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+
+nf-real-nop: clean $(SRCS-y)
+	@mkdir -p build/app
+	$(CC) $(CFLAGS) -DDEBUG_REAL_NOP $(SRCS-y) -o build/app/nf $(LDFLAGS) $(LDFLAGS_STATIC)
+
+clean:
+	rm -f build/app/nf
+
+# =======
+# Running
+# =======
+
+run: nf
+	@sudo ./build/app/nf || true
+
+# Compile the NF to do absolutely nothing
+run-nop: nf-real-nop
+	@sudo ./build/app/nf || true
+
+run-debug-log: nf-debug-log
+	@sudo ./build/app/nf || true
+
+run-debug-stat-log: nf-debug-stat-log
+	@sudo ./build/app/nf || true
+
+run-profile: nf-debug
+## Default: profiling cpu cycles
+	@sudo perf record -F 500 -s -D 12000 -e cycles:ppp --call-graph dwarf ./build/app/nf
+## Sampling
+#	@sudo perf record -F 1000 -s -D 12000 -e mem_load_retired.l3_miss:ppp --call-graph dwarf ./build/app/nf
+## Stats
+#	@sudo perf stat -D 12000 -e L1-dcache-loads,L1-dcache-load-misses,L1-icache-load-misses,LLC-loads,LLC-load-misses,L1-dcache-stores,L1-dcache-store-misses,LLC-stores,LLC-store-misses,dTLB-load-misses,dTLB-loads,dTLB-store-misses,dTLB-stores,faults,branches,branch-misses,instructions,cycles ./build/app/nf || true
+#	@sudo perf stat --cpu=8 -D 12000 -A -e cycle_activity.cycles_l3_miss,cycle_activity.cycles_l2_miss,cycle_activity.stalls_l3_miss,cycle_activity.stalls_l2_miss,instructions,cycles ./build/app/nf || true
+## Tracing long-latency system-level event
+## Remember to disable heatup when using these
+#	@sudo perf sched record --cpu=8 ./build/app/nf
+#	@sudo trace-cmd record -e all -M 100 ./build/app/nf
+#	@sudo trace-cmd record -e exceptions:page_fault_user -T -M 100 ./build/app/nf
+#	@sudo perf trace record --cpu=8 --call-graph dwarf -e exceptions:page_fault_user ./build/app/nf
+#	@sudo perf record -F 1000 -s -e major-faults,minor-faults --call-graph dwarf ./build/app/nf
+## Tracing with intel PT (using snapshot mode to avoid trace data loss, see here: https://man7.org/linux/man-pages/man1/perf-intel-pt.1.html)
+#	@sudo perf record -S0x80000 -e intel_pt/cyc=1/u ./build/app/nf || true
+
+run-scal-profile: nf-scal-profile
+	@sudo ./build/app/nf || true

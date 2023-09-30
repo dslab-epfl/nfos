@@ -1,0 +1,12 @@
+#define MAC_TABLE_SIZE 65536
+
+#ifndef EXPIRATION_TIME
+#define EXPIRATION_TIME 1200000 // 1.2 sec
+#endif
+
+#define PERIODIC_HANDLER_PERIOD 10 // 10 usecs
+#define REFRESH_INTERVAL 180000000000LL
+
+#ifndef LCORES
+#define LCORES "8,10,12,14,16"
+#endif

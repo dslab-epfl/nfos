@@ -1,0 +1,40 @@
+diff --git a/drivers/net/ice/ice_ethdev.c b/drivers/net/ice/ice_ethdev.c
+index 9a5d6a559f..1dd7b00df2 100644
+--- a/drivers/net/ice/ice_ethdev.c
++++ b/drivers/net/ice/ice_ethdev.c
+@@ -4162,7 +4162,7 @@ ice_get_rss_lut(struct ice_vsi *vsi, uint8_t *lut, uint16_t lut_size)
+ 	if (!lut)
+ 		return -EINVAL;
+ 
+-	if (pf->flags & ICE_FLAG_RSS_AQ_CAPABLE) {
++	if (0 == 1) {
+ 		lut_params.vsi_handle = vsi->idx;
+ 		lut_params.lut_size = lut_size;
+ 		lut_params.lut_type = ICE_AQC_GSET_RSS_LUT_TABLE_TYPE_PF;
+@@ -4174,7 +4174,7 @@ ice_get_rss_lut(struct ice_vsi *vsi, uint8_t *lut, uint16_t lut_size)
+ 			return -EINVAL;
+ 		}
+ 	} else {
+-		uint64_t *lut_dw = (uint64_t *)lut;
++		uint32_t *lut_dw = (uint32_t *)lut;
+ 		uint16_t i, lut_size_dw = lut_size / 4;
+ 
+ 		for (i = 0; i < lut_size_dw; i++)
+@@ -4198,7 +4198,7 @@ ice_set_rss_lut(struct ice_vsi *vsi, uint8_t *lut, uint16_t lut_size)
+ 	pf = ICE_VSI_TO_PF(vsi);
+ 	hw = ICE_VSI_TO_HW(vsi);
+ 
+-	if (pf->flags & ICE_FLAG_RSS_AQ_CAPABLE) {
++	if (1 == 0) {
+ 		lut_params.vsi_handle = vsi->idx;
+ 		lut_params.lut_size = lut_size;
+ 		lut_params.lut_type = ICE_AQC_GSET_RSS_LUT_TABLE_TYPE_PF;
+@@ -4210,7 +4210,7 @@ ice_set_rss_lut(struct ice_vsi *vsi, uint8_t *lut, uint16_t lut_size)
+ 			return -EINVAL;
+ 		}
+ 	} else {
+-		uint64_t *lut_dw = (uint64_t *)lut;
++		uint32_t *lut_dw = (uint32_t *)lut;
+ 		uint16_t i, lut_size_dw = lut_size / 4;
+ 
+ 		for (i = 0; i < lut_size_dw; i++)

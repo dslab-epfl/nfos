@@ -1,0 +1,23 @@
+#define WAN_DEVICE_ONE 0
+#define LAN_DEVICE_ONE 1
+#define WAN_DEVICE_TWO 2
+#define LAN_DEVICE_TWO 3
+#define FLOW_CAPACITY 65536
+
+#ifndef EXPIRATION_TIME
+#define EXPIRATION_TIME 1200000 // 1.2 sec
+#endif
+
+#define BACKEND_CAPACITY 32
+#define CHT_HEIGHT 97
+#define BACKEND_EXPIRATION_TIME 10000000LL // 10 sec
+
+#define PERIODIC_HANDLER_PERIOD 10LL // 10 usec
+
+#define LB_CAPACITY 7
+#define IP4_PLY_POOL_CAPACITY 30
+#define N_FIB_TABLE 4
+
+#ifndef LCORES
+#define LCORES "8,10,12,14,16"
+#endif

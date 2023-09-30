@@ -1,0 +1,13 @@
+diff --git a/nf.c b/nf.c
+index 2331ae0d..c241977f 100644
+--- a/nf.c
++++ b/nf.c
+@@ -598,7 +598,7 @@ int MAIN(int argc, char *argv[]) {
+ #ifndef LOAD_BALANCING
+   lcore_funcs[lcore] = idle_main;
+ #else
+-  lcore_funcs[lcore] = lb_main;
++  lcore_funcs[lcore] = idle_main;
+   lb_init(num_lcores - 1);
+ #endif
+ #endif

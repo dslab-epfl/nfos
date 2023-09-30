@@ -1,0 +1,5 @@
+Patch dependency indicated by the names, e.g., X.Y.Z depends on X.Y depends on X.
+
+Those are temporary patches.
+
+The file updated-patches lists the patches that is up-to-date, i.e., can be applied

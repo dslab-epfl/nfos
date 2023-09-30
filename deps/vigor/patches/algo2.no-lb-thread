@@ -1,0 +1,26 @@
+diff --git a/nf-lb/lb.c b/nf-lb/lb.c
+index b344dc7a..126c0080 100644
+--- a/nf-lb/lb.c
++++ b/nf-lb/lb.c
+@@ -303,7 +303,7 @@ int lb_main(void* unused) {
+ #ifdef ENABLE_LOG
+             memcpy(old_reta_debug, new_reta, NUM_FLOW_PARTITIONS * sizeof(uint16_t));
+ #endif
+-            if (is_reta_update_needed) {
++            if (is_reta_update_needed > 1) {
+                 // set migration flag
+                 migration_sync = 1;
+                 barrier_wait();
+diff --git a/nf.c b/nf.c
+index cc84403e..640a2c50 100644
+--- a/nf.c
++++ b/nf.c
+@@ -712,7 +712,7 @@ int MAIN(int argc, char *argv[]) {
+ #ifndef LOAD_BALANCING
+   lcore_funcs[lcore] = idle_main;
+ #else
+-  lcore_funcs[lcore] = lb_main;
++  lcore_funcs[lcore] = idle_main;
+   lb_init(num_lcores - 1);
+ #endif
+ #endif
