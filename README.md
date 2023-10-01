@@ -14,6 +14,11 @@ A framework that enables developers to develop scalable software network functio
 ```bash
 # Note: Put nfos under ${HOME}, currently the dependencies
 # can only be built if nfos is put under ${HOME}.
+
+cd ~/nfos
+git submodule init
+git submodule update
+
 cd ~/nfos && bash deps/setup-deps.sh
 ```
 
