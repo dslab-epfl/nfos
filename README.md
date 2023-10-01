@@ -12,7 +12,9 @@ A framework that enables developers to develop scalable software network functio
 ## Build dependencies
 
 ```bash
-cd nfos && bash deps/setup-deps.sh
+# Note: Put nfos under ${HOME}, currently the dependencies
+# can only be built if nfos is put under ${HOME}.
+cd ~/nfos && bash deps/setup-deps.sh
 ```
 
 ## Run NF
