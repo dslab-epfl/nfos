@@ -20,6 +20,7 @@ git submodule init
 git submodule update
 
 cd ~/nfos && bash deps/setup-deps.sh
+. ${HOME}/.profile
 ```
 
 ## Run NF
