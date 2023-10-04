@@ -1,0 +1,17 @@
+{
+  "cfg": {
+    "nic": 0,
+    "id": [
+      {
+        "layer": 3,
+        "proto": "ipv4",
+        "hdr fields": ["src_ip", "dst_ip"]
+      },
+      {
+        "layer": 4,
+        "proto": "tcp|udp",
+        "hdr fields": ["src_port", "dst_port"]
+      }
+    ]
+  }
+}

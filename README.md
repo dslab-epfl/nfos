@@ -8,6 +8,7 @@ A framework that enables developers to develop scalable software network functio
 - `src`: Source code
   - `src/include/nf.h`: NFOS interface
 - `nf`: Example NFs
+- `utils`: Scripts, see utils/README.md 
 
 ## Build dependencies
 

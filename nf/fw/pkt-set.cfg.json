@@ -1,0 +1,35 @@
+{
+  "comment": "Here a packet set is a flow. A flow is the set of packets belonging to the\nsame L4 connection between a LAN and a WAN host (Here a connection is\ndefined to include packets in both directions).",
+  "cfg": [
+    {
+      "nic": 0,
+      "id": [
+        {
+          "layer": 3,
+          "proto": "ipv4",
+          "hdr fields": ["src_ip", "dst_ip"]
+        },
+        {
+          "layer": 4,
+          "proto": "tcp|udp",
+          "hdr fields": ["src_port", "dst_port"]
+        }
+      ]
+    },
+    {
+      "nic": 1,
+      "id": [
+        {
+          "layer": 3,
+          "proto": "ipv4",
+          "hdr fields": ["dst_ip", "src_ip"]
+        },
+        {
+          "layer": 4,
+          "proto": "tcp|udp",
+          "hdr fields": ["dst_port", "src_port"]
+        }
+      ]
+    }
+  ]
+}
