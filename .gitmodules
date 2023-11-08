@@ -1,3 +1,6 @@
 [submodule "deps/mv-rlu"]
 	path = deps/mv-rlu
 	url = https://github.com/dslab-epfl/mv-rlu.git
+[submodule "nfos-experiments"]
+	path = nfos-experiments
+	url = https://github.com/dslab-epfl/nfos-experiments.git
