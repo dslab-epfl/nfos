@@ -1,6 +1,8 @@
 # Network Function Operating System (NFOS)
 
-A framework that enables developers to develop scalable software network functions without dealing with concurrency.
+A programming model, runtime, and profiler for productively developing software network functions (NFs) that scale on multicore machines without dealing with concurrency.
+
+See our [EuroSys'24](https://2024.eurosys.org/) paper "Transparent Multicore Scaling of Single-Threaded Network Functions"
 
 ## Repository structure
 
