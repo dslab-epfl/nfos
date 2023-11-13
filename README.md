@@ -2,7 +2,7 @@
 
 A programming model, runtime, and profiler for productively developing software network functions (NFs) that scale on multicore machines without dealing with concurrency.
 
-See our [EuroSys'24](https://2024.eurosys.org/) paper "Transparent Multicore Scaling of Single-Threaded Network Functions".
+See our [EuroSys'24](https://2024.eurosys.org/) paper [Transparent Multicore Scaling of Single-Threaded Network Functions](https://dslab.epfl.ch/pubs/nfos.pdf).
 
 ## Repository structure
 
